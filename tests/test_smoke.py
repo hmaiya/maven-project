@@ -79,3 +79,22 @@ def test_rows_load_into_sqlite_and_reload_is_idempotent(raw_dir: Path, tmp_path:
 
     loaded = query(db, "select customer_email_key from tickets where status = 'resolved'")
     assert loaded == [{"customer_email_key": "bob@gmail.com"}]
+
+
+def test_one_bad_field_rejects_the_record_not_the_run(raw_dir: Path) -> None:
+    (raw_dir / "tickets.json").write_text(json.dumps(
+        {"tickets": [{"id": 9, "created_at": 1772000000, "updated_at": "garbage"}]}))
+    assert t.tickets(raw_dir) == []
+    assert "unparseable timestamp" in t.REJECTS[0]["reason"]
+
+
+def test_other_entities_files_are_not_read_as_tickets(raw_dir: Path) -> None:
+    (raw_dir / "customers.json").write_text(json.dumps([{"id": 100, "created_at": 1772000000}]))
+    assert {r["source_id"] for r in t.tickets(raw_dir)} == {"1", "4"}
+
+
+def test_clean_rerun_clears_previous_rejects(tmp_path: Path) -> None:
+    db = tmp_path / "warehouse.db"
+    write_all(db, {"tickets": [{"a": 1}], "rejects": [{"reason": "x"}]})
+    write_all(db, {"tickets": [{"a": 1}], "rejects": []})
+    assert "rejects" not in table_counts(db)

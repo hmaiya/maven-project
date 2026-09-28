@@ -9,6 +9,23 @@ Setup is already done. **The only file you should need to write in is
 
 ---
 
+## Game plan when the question lands (60–90 min)
+
+| Time | Do | Say out loud |
+|---|---|---|
+| 0–5 min | Read the prompt twice. Ask: which entities? what is the canonical output? is it files or an API? any known quirks (timezones, currencies, IDs shared across systems)? | Restate the goal in one sentence and confirm it. |
+| 5–10 | Get data into `data/raw/` (step 1), then `uv run unify profile` (step 2). | Walk through nulls, mixed shapes, and enum candidates. "Here's what I'm designing for." |
+| 10–15 | Write down the canonical schema as a comment at the top of `transform.py`: one table per entity, with `source_system`/`source_id` on each. | Explain your join key (usually `email_key`) and why. |
+| 15–45 | One entity end-to-end first: mapper → `unify run` → `unify query`. **Then** the second entity. Commit after each one works. | Narrate each mapping decision. When unsure, pick one, leave a `# TODO:` and move on. |
+| 45–55 | Look at rejects and the `unmapped …` lines from `unify run`. Close the easy gaps; add `# TODO:` for the rest. Point one smoke test at your mapper. | "Nothing is dropped silently; here is every reject and why." |
+| 55–60 | `make test`, commit, walk them through the output and the TODOs. | Use "Things to say out loud" below as the "what's next" list. |
+
+Rules of thumb: get something running end to end before polishing anything. Prompt Claude
+with the profile output pasted in ("map these fields to this schema"), then
+review what it writes; don't accept a mapping you can't explain.
+
+---
+
 ## Interview day: the six steps
 
 ### 1. Get the data into `data/raw/`
@@ -65,12 +82,22 @@ every helper. Adapt it, then uncomment the line in `transform()` that calls it:
 def transform(raw_dir: Path) -> dict[str, list[dict]]:
     tables = {}
     tables["tickets"] = tickets(raw_dir)        # <- uncomment / rename
-    if REJECTS:
-        tables["rejects"] = REJECTS
+    tables["rejects"] = REJECTS
     return tables
 ```
 
 `transform()` returns `{table_name: rows}`. Anything you return gets a table.
+
+For each new entity, copy the pattern:
+
+- **Scope the files.** `iter_files(raw_dir, "**/*ticket*")` reads only the ticket files. With a
+  bare `iter_files(raw_dir)`, `customers.csv` would be mapped as tickets too.
+- **Keep the per-record `try/except ValueError`**, so one bad field rejects one record
+  instead of crashing the run.
+- **Put vocabularies in module-level `n.mapper(...)` constants.** `unify run` finds them
+  and prints any values that fell through to `unknown`.
+- **Declare per-source quirks in the mapper:** `n.timestamp(v, dayfirst=True)`,
+  `n.timestamp(v, tz=ZoneInfo("Europe/London"))`, `n.money_minor(v, currency="EUR")`.
 
 ### 4. Run it
 
@@ -78,8 +105,10 @@ def transform(raw_dir: Path) -> dict[str, list[dict]]:
 uv run unify run
 ```
 
-Prints a row count per table and flags rejects. Re-runnable: it drops and
-rebuilds the tables, so a broken run is safe to just run again.
+Prints a row count per table, flags rejects, and lists any **unmapped enum
+values** (for example `unmapped STATUS -> 'unknown': escalated (3)`). You can re-run it
+safely: it drops and rebuilds every table it writes. After a clean run the
+`rejects` table is dropped, so an old reject never shows up as a new one.
 
 ### 5. Check the result
 
@@ -90,7 +119,7 @@ uv run unify query "select reason, count(*) from rejects group by 1 order by 2 d
 uv run pytest
 ```
 
-### 6. Package it after the interview
+### 6. Package it
 
 All three options run the tests and lint first, and stop if anything fails.
 Pick whichever one fits who's receiving it.
@@ -134,7 +163,23 @@ after any change; and it only runs on the OS and chip it was built on
 (this Mac builds a macOS arm64 binary).
 
 All three versions read `./data/raw` from the folder they're run in. Use
-`UNIFY_RAW_DIR` to point somewhere else.
+`UNIFY_RAW_DIR` to point somewhere else, and `UNIFY_DB` to write the database
+somewhere else.
+
+**D. Container (deploy as a scheduled batch job).** Docker isn't installed on
+this machine, so this file has not been built here:
+
+```bash
+docker build -t unify .
+docker run --rm -v "$PWD/data:/work/data" -v "$PWD/out:/work/out" unify run
+docker run --rm -e UNIFY_API_BASE -e UNIFY_API_TOKEN -v "$PWD/data:/work/data" unify fetch /tickets
+```
+
+To deploy it for real, run the same image as a scheduled job (ECS scheduled task,
+Cloud Run job, K8s CronJob) running `unify fetch … && unify run`, with the token
+supplied from a secret manager and SQLite replaced by the team's warehouse. If
+they ask how you'd deploy it, give that answer. Don't build it during the
+exercise.
 
 ---
 
@@ -151,6 +196,8 @@ All three versions read `./data/raw` from the folder they're run in. Use
 | `src/unify/cli.py` | The `unify` command. |
 | `tests/` | Unit tests for the cleaners, readers and API client (mock server, no network), plus one end-to-end smoke test. |
 | `Makefile` | `make test`, `make package`, `make binary`, `make clean`. |
+| `Dockerfile` | Batch-job image for deployment. Entrypoint is `unify`. |
+| `AGENTS.md` / `CLAUDE.md` | Conventions for the AI assistant: reject rather than drop, lineage on every row, UTC, integer cents. `CLAUDE.md` imports `AGENTS.md`. |
 | `data/raw/` | Empty. Their data goes here. |
 | `out/warehouse.db` | Created by `unify run`. Gitignored. |
 
@@ -212,6 +259,24 @@ true of this scaffold, so they are honest to raise:
 
 ---
 
+## Using Claude during the exercise
+
+`CLAUDE.md` loads the repo conventions automatically. The data plugin skills that help
+most here:
+
+| When | Invoke |
+|---|---|
+| New file you don't understand yet | `/data:explore-data data/raw/<file>`, alongside `unify profile` |
+| Writing checks against the loaded tables | `/data:write-query` (tell it the dialect is SQLite) |
+| Before you demo the result | `/data:validate-data` to catch duplicate keys, bad joins, and suspicious counts |
+
+A prompt that works well: *"Here is the `unify profile` output and the target schema.
+Write `customers()` in transform.py following the `tickets()` pattern. Use
+n.mapper for every enum, and add `# TODO:` for anything ambiguous."* Then read
+the diff before running it.
+
+---
+
 ## One-time setup (already done)
 
 Python 3.12 and [uv](https://docs.astral.sh/uv/) are installed and the venv is
@@ -219,5 +284,5 @@ built. To verify, or to rebuild on another machine:
 
 ```bash
 uv sync
-uv run pytest        # 65 tests, ~0.1s
+uv run pytest        # 68 tests, ~0.1s
 ```

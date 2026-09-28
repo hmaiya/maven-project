@@ -25,7 +25,9 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def write_table(conn: sqlite3.Connection, name: str, rows: Sequence[dict[str, Any]]) -> int:
     """Replace `name` with `rows`. Columns are the union of all row keys."""
+    conn.execute(f'DROP TABLE IF EXISTS "{name}"')
     if not rows:
+        conn.commit()
         return 0
 
     columns: dict[str, str] = {}
@@ -36,7 +38,6 @@ def write_table(conn: sqlite3.Connection, name: str, rows: Sequence[dict[str, An
             columns.setdefault(key, "TEXT")
 
     definition = ", ".join(f'"{column}" {sql_type}' for column, sql_type in columns.items())
-    conn.execute(f'DROP TABLE IF EXISTS "{name}"')
     conn.execute(f'CREATE TABLE "{name}" ({definition})')
     placeholders = ", ".join(["?"] * len(columns))
     conn.executemany(

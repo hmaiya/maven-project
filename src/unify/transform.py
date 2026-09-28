@@ -45,8 +45,8 @@ def transform(raw_dir: Path) -> dict[str, list[dict[str, Any]]]:
     # tables["tickets"] = tickets(raw_dir)
     # tables["customers"] = customers(raw_dir)
 
-    if REJECTS:
-        tables["rejects"] = REJECTS
+    # Always returned, even empty, so a clean run clears the last run's rejects.
+    tables["rejects"] = REJECTS
     return tables
 
 
@@ -70,7 +70,9 @@ PRIORITY = n.mapper({
 
 def tickets(raw_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for path in iter_files(raw_dir):
+    # Scope to this entity's files. iter_files(raw_dir) alone would also feed
+    # customers.csv, orders.json etc. through the ticket mapping.
+    for path in iter_files(raw_dir, "**/*ticket*"):
         source = path.stem
         on_error = partial(_reject_read_error, source)
         for raw in read_any(path, on_error=on_error):
@@ -78,22 +80,26 @@ def tickets(raw_dir: Path) -> list[dict[str, Any]]:
             if source_id is None:
                 reject(raw, "missing id", source)
                 continue
+            # One bad field rejects one record, never the whole run.
             try:
-                created = n.timestamp(pluck(raw, "created_at"))
+                row = _ticket_row(raw, source, source_id)
             except ValueError as exc:
                 reject(raw, str(exc), source, source_id)
                 continue
-
-            rows.append({
-                "source_system": source,
-                "source_id": str(source_id),
-                "subject": n.clean(pluck(raw, "subject")),
-                "status": STATUS(pluck(raw, "status")),
-                "priority": PRIORITY(pluck(raw, "priority")),
-                "customer_email": n.email(pluck(raw, "requester.email")),
-                "customer_email_key": n.email_key(pluck(raw, "requester.email")),
-                "body": n.strip_html(pluck(raw, "description")),
-                "created_at": n.iso(created),
-                "updated_at": n.iso(n.timestamp(pluck(raw, "updated_at"))),
-            })
+            rows.append(row)
     return rows
+
+
+def _ticket_row(raw: dict[str, Any], source: str, source_id: Any) -> dict[str, Any]:
+    return {
+        "source_system": source,
+        "source_id": str(source_id),
+        "subject": n.clean(pluck(raw, "subject")),
+        "status": STATUS(pluck(raw, "status")),
+        "priority": PRIORITY(pluck(raw, "priority")),
+        "customer_email": n.email(pluck(raw, "requester.email")),
+        "customer_email_key": n.email_key(pluck(raw, "requester.email")),
+        "body": n.strip_html(pluck(raw, "description")),
+        "created_at": n.iso(n.timestamp(pluck(raw, "created_at"))),
+        "updated_at": n.iso(n.timestamp(pluck(raw, "updated_at"))),
+    }

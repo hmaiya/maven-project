@@ -123,6 +123,16 @@ def run() -> None:
         console.print(f"[red]{rejects} rejected row(s)[/] — unify query \"select reason, count(*) "
                       'from rejects group by 1 order by 2 desc"')
 
+    # Values that fell through to "unknown". Each one is a mapping decision
+    # still to make, so print them rather than leave them in memory.
+    from . import transform as module
+    from .normalize import _Mapper
+
+    for name, obj in vars(module).items():
+        if isinstance(obj, _Mapper) and obj.unmapped:
+            values = ", ".join(f"{k} ({v})" for k, v in sorted(obj.unmapped.items(), key=lambda kv: -kv[1]))
+            console.print(f"[yellow]unmapped {name}[/] -> {obj.default!r}: {values}")
+
 
 @app.command(name="query")
 def query_cmd(

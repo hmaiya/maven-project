@@ -65,7 +65,12 @@ class Field:
 
     @property
     def shape(self) -> str:
-        return self.shapes.most_common(1)[0][0] if self.shapes else "-"
+        """Dominant shape. Mixed columns show both, e.g. "epoch_s+iso8601",
+        because one field in two formats is the thing the mapping must handle."""
+        if not self.shapes:
+            return "-"
+        top = [name for name, _ in self.shapes.most_common(2)]
+        return "+".join(top)
 
     @property
     def enum_values(self) -> list[str] | None:
@@ -76,7 +81,7 @@ class Field:
         """
         if self.capped or not 1 < len(self.distinct) <= 25:
             return None
-        if self.shape not in {"text", "integer"}:
+        if self.shapes.most_common(1)[0][0] not in {"text", "integer"}:
             return None
         if len(self.distinct) == self.count - self.nulls and self.count > 5:
             return None
