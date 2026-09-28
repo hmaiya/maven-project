@@ -1,5 +1,6 @@
-"""unify — inspect raw data, run the transform, query the result.
+"""unify — pull or inspect raw data, run the transform, query the result.
 
+    unify fetch /tickets        pull an API endpoint into data/raw
     unify profile               what is in data/raw
     unify run                   transform + load into out/warehouse.db
     unify query "select ..."    ad hoc SQL
@@ -22,11 +23,39 @@ from .profile import profile_dir
 app = typer.Typer(add_completion=False, help=__doc__, no_args_is_help=True)
 console = Console()
 
-ROOT = Path(__file__).resolve().parents[2]
-# Override either with an env var when the data lands somewhere else:
-#   UNIFY_RAW_DIR=~/Downloads/exercise-data uv run unify profile
+# Relative to where the command is run, not where the package is installed,
+# so an installed wheel or a PyInstaller binary still finds ./data/raw.
+# Override with env vars when the data lives elsewhere:
+#   UNIFY_RAW_DIR=~/Downloads/exercise-data unify profile
+ROOT = Path.cwd()
 RAW_DIR = Path(os.environ.get("UNIFY_RAW_DIR", ROOT / "data" / "raw")).expanduser()
 DB_PATH = Path(os.environ.get("UNIFY_DB", ROOT / "out" / "warehouse.db")).expanduser()
+
+
+@app.command()
+def fetch(
+    endpoint: Annotated[str, typer.Argument(help="Path or full URL, e.g. /tickets")],
+    name: Annotated[str | None, typer.Option(help="Output file stem (default: last path part)")] = None,
+    records_at: Annotated[str | None, typer.Option(help="Dotted path to the record list")] = None,
+    next_at: Annotated[str | None, typer.Option(help="Dotted path to the next-page URL")] = None,
+    page_param: Annotated[str | None, typer.Option(help="Query param for page numbers")] = None,
+) -> None:
+    """Pull every page of an API endpoint into data/raw/<name>.jsonl.
+
+    Auth and base URL come from UNIFY_API_TOKEN and UNIFY_API_BASE.
+    """
+    from .client import ApiClient, dump_jsonl
+
+    stem = name or endpoint.rstrip("/").split("/")[-1].split("?")[0] or "records"
+    out = RAW_DIR / f"{stem}.jsonl"
+    client = ApiClient()
+    try:
+        count = dump_jsonl(
+            client.paginate(endpoint, records_at=records_at, next_at=next_at, page_param=page_param), out
+        )
+    finally:
+        client.close()
+    console.print(f"[green]{count:,} records[/] -> {out}")
 
 
 @app.command()
