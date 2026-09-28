@@ -11,3 +11,6 @@ build/
 *.sqlite3
 .DS_Store
 .env
+
+# Private prep notes, never published
+INTERVIEW_NOTES.md
