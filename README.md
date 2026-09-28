@@ -4,7 +4,7 @@ Scaffolding for the Maven AGI coding exercise: pull customer data from an
 API or the files they give you, normalize it, load it into SQLite, and show
 what came through and what did not.
 
-Setup is already done. **The only file you should need to write in is
+Setup is already done. **We start by writing logic in this file
 `src/unify/transform.py`.**
 
 ---
