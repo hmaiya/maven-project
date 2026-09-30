@@ -4,14 +4,18 @@ A recording is JSON Lines, one RealtimeServerEvent per line. A single
 conversation item (a user utterance, a bot reply, a tool call, a tool result)
 is spread across many events: created once, streamed as deltas, finalised by
 a `.done` event, and sometimes cancelled mid-stream. This module folds those
-events into one `Item` per item_id and one `Response` per response_id.
+events into one `Item` per item_id and one `Response` per response_id, then
+turns those into an ordered list of actions:
 
-Step 1 (this file so far) is parsing only: no classification or ordering.
+    parse_file()     events -> Conversation (items, responses)
+    build_actions()  Conversation -> [user-message | bot-message |
+                     function-call | function-response], threaded and linked
 Event reference: https://platform.openai.com/docs/api-reference/realtime-server-events
 """
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -268,6 +272,149 @@ HANDLERS: dict[str, Callable[[Conversation, Event, int], None]] = {
     "input_audio_buffer.committed": ignore,
     "rate_limits.updated": ignore,
 }
+
+# --- classify, thread, link ------------------------------------------------
+
+ACTION_TYPES = {
+    ("message", "user"): "user-message",
+    ("message", "assistant"): "bot-message",
+    ("function_call", None): "function-call",
+    ("function_call_output", None): "function-response",
+}
+
+
+def classify(item: Item) -> str:
+    role = item.role if item.item_type == "message" else None
+    return ACTION_TYPES.get((item.item_type, role), "unknown")
+
+
+def thread_order(conv: Conversation) -> tuple[list[Item], list[str]]:
+    """Items in conversation order, following previous_item_id.
+
+    previous_item_id is the server's statement of where an item sits, so it
+    wins over arrival order (the user transcript, for one, arrives late).
+    Arrival order breaks ties between roots and between siblings.
+    Returns the order plus any threading problems found.
+    """
+    issues: list[str] = []
+    children: dict[str | None, list[Item]] = {}
+    for item in conv.items.values():
+        parent = item.previous_item_id if item.previous_item_id in conv.items else None
+        if item.previous_item_id and parent is None:
+            issues.append(f"{item.item_id}: previous_item_id {item.previous_item_id} not in recording")
+        children.setdefault(parent, []).append(item)
+
+    for parent, kids in children.items():
+        if parent is not None and len(kids) > 1:
+            issues.append(f"{parent}: thread forks into {[k.item_id for k in kids]}")
+
+    ordered: list[Item] = []
+    seen: set[str] = set()
+    stack = sorted(children.get(None, []), key=lambda i: i.first_seq, reverse=True)
+    while stack:
+        item = stack.pop()
+        if item.item_id in seen:
+            continue
+        seen.add(item.item_id)
+        ordered.append(item)
+        stack.extend(sorted(children.get(item.item_id, []), key=lambda i: i.first_seq, reverse=True))
+
+    # A cycle leaves items unreachable from any root. Keep them, flagged.
+    for item in conv.items.values():
+        if item.item_id not in seen:
+            issues.append(f"{item.item_id}: unreachable in previous_item_id chain")
+            ordered.append(item)
+    return ordered, issues
+
+
+def build_actions(conv: Conversation) -> tuple[list[dict[str, Any]], list[str]]:
+    """Ordered actions with call/response links and per-item issues."""
+    ordered, thread_issues = thread_order(conv)
+
+    calls = {i.call_id: i for i in ordered if classify(i) == "function-call" and i.call_id}
+    outputs = {i.call_id: i for i in ordered if classify(i) == "function-response" and i.call_id}
+
+    actions = [_action(item, conv, calls, outputs) for item in ordered]
+    for position, action in enumerate(actions, start=1):
+        action["position"] = position
+    return actions, thread_issues
+
+
+def _action(
+    item: Item, conv: Conversation, calls: dict[str, Item], outputs: dict[str, Item]
+) -> dict[str, Any]:
+    kind = classify(item)
+    response = conv.responses.get(item.response_id or "")
+    issues: list[str] = []
+    action: dict[str, Any] = {
+        "type": kind,
+        "itemId": item.item_id,
+        "previousItemId": item.previous_item_id,
+        "callId": item.call_id,
+        "responseId": item.response_id,
+        "status": item.status,
+        "responseStatus": response.status if response else None,
+        "firstEventId": item.first_event_id,
+        "eventRange": [item.first_seq, item.last_seq],
+    }
+
+    if kind == "user-message":
+        action["text"] = item.text
+        action["audioStartMs"] = item.audio_start_ms
+        action["audioEndMs"] = item.audio_end_ms
+        if item.text is None:
+            issues.append(f"no_transcript: {item.transcription_error}" if item.transcription_error
+                          else "no_transcript")
+
+    elif kind == "bot-message":
+        action["text"] = item.text
+        if response and response.status == "cancelled":
+            # Server cancels on barge-in (the user started speaking), so the
+            # text here is what was generated, not necessarily what was heard.
+            issues.append("interrupted")
+        elif response and response.done_seq is None:
+            issues.append("response_never_completed")
+        if item.text is None:
+            issues.append("no_text")
+
+    elif kind == "function-call":
+        action["name"] = item.name
+        action["arguments"] = _json_or_raw(item.arguments, issues)
+        answer = outputs.get(item.call_id or "")
+        action["responseItemId"] = answer.item_id if answer else None
+        if answer is None:
+            issues.append("no_function_response")
+
+    elif kind == "function-response":
+        call = calls.get(item.call_id or "")
+        action["name"] = call.name if call else None
+        action["callItemId"] = call.item_id if call else None
+        action["output"] = item.output
+        if call is None:
+            issues.append("no_matching_function_call")
+        if not (item.output or "").strip():
+            issues.append("empty_output")
+
+    else:
+        # TODO: new item types (e.g. mcp_call) need a type in ACTION_TYPES
+        # and an output shape; they are kept here rather than dropped.
+        action["itemType"] = item.item_type
+        issues.append(f"unclassified item type {item.item_type!r}")
+
+    action["issues"] = issues
+    return action
+
+
+def _json_or_raw(text: str | None, issues: list[str]) -> Any:
+    if text is None:
+        issues.append("no_arguments")
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        issues.append("arguments_not_json")
+        return text
+
 
 # TODO: conversation.item.truncated (client truncated a bot reply to what was
 # actually played) and conversation.item.deleted are not in this recording.

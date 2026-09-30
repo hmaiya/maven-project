@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from unify.realtime import parse_events, parse_file
+from unify.realtime import build_actions, parse_events, parse_file
 
 
 def created(item: dict, previous: str | None = None) -> dict:
@@ -98,3 +98,74 @@ def test_truncated_last_line_is_reported(tmp_path: Path) -> None:
     conv = parse_file(path)
     assert conv.session["id"] == "s1"
     assert conv.read_errors and "line 2" in conv.read_errors[0]
+
+
+# --- step 2: classify, thread, link ------------------------------------------
+
+
+def msg(item_id: str, role: str) -> dict:
+    return {"id": item_id, "type": "message", "role": role}
+
+
+def test_each_item_type_maps_to_one_action_type() -> None:
+    actions, _ = build_actions(parse_events([
+        created(msg("u1", "user")),
+        created({"id": "f1", "type": "function_call", "call_id": "c1", "name": "lookup"}, "u1"),
+        created({"id": "o1", "type": "function_call_output", "call_id": "c1", "output": "ok"}, "f1"),
+        created(msg("b1", "assistant"), "o1"),
+    ]))
+    assert [a["type"] for a in actions] == [
+        "user-message", "function-call", "function-response", "bot-message"]
+
+
+def test_previous_item_id_beats_arrival_order() -> None:
+    actions, issues = build_actions(parse_events([
+        created(msg("b1", "assistant"), "u1"),       # arrives first, but threads after u1
+        created(msg("u1", "user")),
+    ]))
+    assert [a["itemId"] for a in actions] == ["u1", "b1"]
+    assert issues == []
+
+
+def test_calls_and_responses_link_both_ways_by_call_id() -> None:
+    actions, _ = build_actions(parse_events([
+        created({"id": "f1", "type": "function_call", "call_id": "c1", "name": "lookup",
+                 "arguments": '{"q": "x"}'}),
+        created({"id": "o1", "type": "function_call_output", "call_id": "c1", "output": "ok"}, "f1"),
+    ]))
+    call, answer = actions
+    assert call["arguments"] == {"q": "x"}
+    assert call["responseItemId"] == "o1" and answer["callItemId"] == "f1"
+    assert answer["name"] == "lookup"
+    assert call["issues"] == answer["issues"] == []
+
+
+def test_orphans_are_flagged_on_both_sides() -> None:
+    actions, _ = build_actions(parse_events([
+        created({"id": "f1", "type": "function_call", "call_id": "c1", "arguments": "{}"}),
+        created({"id": "o2", "type": "function_call_output", "call_id": "c2", "output": "ok"}, "f1"),
+    ]))
+    assert "no_function_response" in actions[0]["issues"]
+    assert "no_matching_function_call" in actions[1]["issues"]
+
+
+def test_interrupted_reply_is_flagged() -> None:
+    actions, _ = build_actions(parse_events([
+        response("created", "r1", "in_progress"),
+        output_item("added", msg("b1", "assistant"), "r1"),
+        response("done", "r1", "cancelled"),
+    ]))
+    assert actions[0]["issues"] == ["interrupted", "no_text"]
+
+
+def test_forks_missing_parents_and_unknown_types_are_kept_and_reported() -> None:
+    actions, issues = build_actions(parse_events([
+        created(msg("u1", "user")),
+        created(msg("b1", "assistant"), "u1"),
+        created(msg("b2", "assistant"), "u1"),
+        created({"id": "x1", "type": "mcp_call"}, "gone"),
+    ]))
+    assert len(actions) == 4
+    assert any("forks" in i for i in issues)
+    assert any("gone" in i for i in issues)
+    assert actions[-1]["type"] == "unknown"
