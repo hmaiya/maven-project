@@ -4,10 +4,12 @@
     unify profile               what is in data/raw
     unify run                   transform + load into out/warehouse.db
     unify query "select ..."    ad hoc SQL
+    unify conversation          rebuild realtime conversations into actions
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Annotated
@@ -132,6 +134,58 @@ def run() -> None:
         if isinstance(obj, _Mapper) and obj.unmapped:
             values = ", ".join(f"{k} ({v})" for k, v in sorted(obj.unmapped.items(), key=lambda kv: -kv[1]))
             console.print(f"[yellow]unmapped {name}[/] -> {obj.default!r}: {values}")
+
+
+@app.command()
+def conversation(
+    path: Annotated[Path | None, typer.Argument(help="A .jsonline file (default: all in data/raw)")] = None,
+    out_dir: Annotated[Path, typer.Option(help="Where to write <stem>.actions.jsonl and .summary.json")] = (
+        ROOT / "out"),
+    width: Annotated[int, typer.Option(help="Characters of text to show per action")] = 90,
+) -> None:
+    """Rebuild a realtime event recording into user/bot/function actions."""
+    from .realtime import analyze, parse_file, write_jsonl
+
+    paths = [path] if path else sorted(RAW_DIR.glob("**/*.jsonline"))
+    if not paths:
+        console.print(f"[yellow]No .jsonline recordings in {RAW_DIR}[/]")
+        raise typer.Exit(1)
+
+    for recording in paths:
+        actions, summary = analyze(parse_file(recording))
+        actions_path = out_dir / f"{recording.stem}.actions.jsonl"
+        summary_path = out_dir / f"{recording.stem}.summary.json"
+        write_jsonl(actions, actions_path)
+        summary_path.write_text(json.dumps(summary, indent=2))
+
+        title = f"{recording.name} · {summary['sessionId']}"
+        table = Table(title=title, header_style="bold", show_lines=True)
+        table.add_column("#", justify="right")
+        table.add_column("type")
+        table.add_column("content", overflow="fold")
+        table.add_column("issues", style="red", overflow="fold")
+        colours = {"user-message": "cyan", "bot-message": "green",
+                   "function-call": "magenta", "function-response": "yellow"}
+        for action in actions:
+            table.add_row(str(action["position"]),
+                          f"[{colours.get(action['type'], 'white')}]{action['type']}[/]",
+                          _content(action)[:width],
+                          "\n".join(action["issues"]))
+        console.print(table)
+        for key in ("responsesCancelledWithoutOutput", "responsesNeverCompleted", "recordingErrors",
+                    "malformedEvents", "threadIssues", "serverErrors"):
+            if summary[key]:
+                console.print(f"[yellow]{key}[/]: {summary[key]}")
+        console.print(f"[green]wrote[/] {actions_path} and {summary_path}")
+
+
+def _content(action: dict) -> str:
+    if action["type"] == "function-call":
+        return f"{action.get('name')}({json.dumps(action.get('arguments'))})"
+    if action["type"] == "function-response":
+        titles = [d["title"] for d in action.get("documents") or []]
+        return f"{len(titles)} document(s): {'; '.join(titles)}" if titles else (action.get("output") or "")
+    return action.get("text") or ""
 
 
 @app.command(name="query")

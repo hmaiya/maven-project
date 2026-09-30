@@ -10,12 +10,15 @@ turns those into an ordered list of actions:
     parse_file()     events -> Conversation (items, responses)
     build_actions()  Conversation -> [user-message | bot-message |
                      function-call | function-response], threaded and linked
+    diagnose()       retrieval quality and grounding flags on those actions
+    summarize()      one conversation-level report
 Event reference: https://platform.openai.com/docs/api-reference/realtime-server-events
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -414,6 +417,123 @@ def _json_or_raw(text: str | None, issues: list[str]) -> Any:
     except json.JSONDecodeError:
         issues.append("arguments_not_json")
         return text
+
+
+# --- diagnose ---------------------------------------------------------------
+
+NO_DOCUMENTS = "No relevant document excerpts found"
+_DOC_HEADER = re.compile(r"---- Doc excerpt ----\s*\nID: (.*)\nTitle: (.*)\nUrl: (.*)")
+_WORD = re.compile(r"[a-z0-9]+")
+STOPWORDS = {"the", "and", "for", "with", "what", "how", "long", "about", "from", "that", "this", "does",
+             "length", "many", "much", "tell", "more", "information"}
+
+# Below this share of query terms appearing in the retrieved text, the
+# retrieval is flagged as unrelated. A lexical proxy chosen for this exercise.
+# TODO: replace with an embedding similarity or an LLM relevance judge, and
+# calibrate the threshold against labelled conversations.
+MIN_QUERY_TERM_COVERAGE = 0.5
+
+
+def parse_tool_output(output: str | None) -> list[dict[str, str]]:
+    """Documents in a Maven `LlmPromptBuilder(prompt=..., urls=[...])` output.
+
+    TODO: this parses the repr of a platform object. Ask the platform team for
+    a structured tool result (JSON) so this regex is not a contract.
+    """
+    return [{"id": i.strip(), "title": t.strip(), "url": u.strip()}
+            for i, t, u in _DOC_HEADER.findall(output or "")]
+
+
+def query_terms(arguments: Any) -> set[str]:
+    values = arguments.values() if isinstance(arguments, dict) else [arguments or ""]
+    text = " ".join(str(v) for v in values)
+    return {w for w in _WORD.findall(text.lower()) if len(w) > 3 and w not in STOPWORDS}
+
+
+def diagnose(actions: list[dict[str, Any]]) -> None:
+    """Flag retrieval problems on function-responses, and bot answers given
+    in a turn where every retrieval came back empty or unrelated."""
+    by_item = {a["itemId"]: a for a in actions}
+    turn_retrievals: list[dict[str, Any]] = []
+    for action in actions:
+        if action["type"] == "user-message":
+            turn_retrievals = []
+        elif action["type"] == "function-response":
+            _diagnose_retrieval(action, by_item.get(action.get("callItemId") or ""))
+            turn_retrievals.append(action)
+        elif action["type"] == "bot-message" and turn_retrievals:
+            if not any(r.get("retrievalOk") for r in turn_retrievals):
+                action["issues"].append("answer_not_grounded_in_retrieved_documents")
+
+
+def _diagnose_retrieval(action: dict[str, Any], call: dict[str, Any] | None) -> None:
+    output = action.get("output") or ""
+    documents = parse_tool_output(output)
+    action["documents"] = documents
+    if NO_DOCUMENTS in output or not documents:
+        action["issues"].append("no_relevant_documents")
+        action["retrievalOk"] = False
+        return
+    terms = query_terms(call.get("arguments")) if call else set()
+    if not terms:
+        action["retrievalOk"] = True
+        return
+    found = sorted(t for t in terms if t in output.lower())
+    action["queryTermCoverage"] = round(len(found) / len(terms), 2)
+    action["queryTermsMissing"] = sorted(terms - set(found))
+    action["retrievalOk"] = action["queryTermCoverage"] >= MIN_QUERY_TERM_COVERAGE
+    if not action["retrievalOk"]:
+        action["issues"].append("documents_unrelated_to_query")
+
+
+# --- output -------------------------------------------------------------------
+
+# Readable key order for the output file. Keys not listed follow in insertion order.
+KEY_ORDER = ["position", "type", "itemId", "previousItemId", "callId", "name", "text", "arguments",
+             "documents", "output", "issues"]
+
+
+def analyze(conv: Conversation) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    actions, thread_issues = build_actions(conv)
+    diagnose(actions)
+    return actions, summarize(conv, actions, thread_issues)
+
+
+def to_record(action: dict[str, Any]) -> dict[str, Any]:
+    """Drop empty fields and put the useful ones first."""
+    ordered = {k: action[k] for k in KEY_ORDER if k in action}
+    ordered.update({k: v for k, v in action.items() if k not in ordered})
+    return {k: v for k, v in ordered.items() if v is not None and v != []}
+
+
+def write_jsonl(actions: list[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        for action in actions:
+            fh.write(json.dumps(to_record(action), ensure_ascii=False) + "\n")
+
+
+def summarize(
+    conv: Conversation, actions: list[dict[str, Any]], thread_issues: list[str]
+) -> dict[str, Any]:
+    responses = list(conv.responses.values())
+    return {
+        "sessionId": conv.session.get("id"),
+        "model": conv.session.get("model"),
+        "tools": [t.get("name") for t in conv.session.get("tools") or []],
+        "events": conv.event_count,
+        "actions": dict(Counter(a["type"] for a in actions)),
+        "responses": dict(Counter(r.status for r in responses)),
+        "responsesCancelledWithoutOutput": [r.response_id for r in responses
+                                            if r.status == "cancelled" and not r.output_item_ids],
+        "responsesNeverCompleted": [r.response_id for r in responses if r.done_seq is None],
+        "issues": dict(Counter(i.split(":")[0] for a in actions for i in a["issues"])),
+        "threadIssues": thread_issues,
+        "recordingErrors": conv.read_errors,
+        "malformedEvents": conv.malformed,
+        "serverErrors": conv.server_errors,
+        "unhandledEventTypes": dict(conv.unhandled),
+    }
 
 
 # TODO: conversation.item.truncated (client truncated a bot reply to what was

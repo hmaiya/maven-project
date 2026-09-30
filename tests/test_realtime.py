@@ -6,9 +6,10 @@ reads as the sequence of events it covers.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from unify.realtime import build_actions, parse_events, parse_file
+from unify.realtime import analyze, build_actions, parse_events, parse_file, parse_tool_output, write_jsonl
 
 
 def created(item: dict, previous: str | None = None) -> dict:
@@ -169,3 +170,58 @@ def test_forks_missing_parents_and_unknown_types_are_kept_and_reported() -> None
     assert any("forks" in i for i in issues)
     assert any("gone" in i for i in issues)
     assert actions[-1]["type"] == "unknown"
+
+
+# --- step 3: diagnose and output ---------------------------------------------
+
+DOCS = ("LlmPromptBuilder(prompt=---- Doc excerpt ----\nID: d1\nTitle: Harvard Bridge facts\nUrl: https://x/1\n"
+        "The Harvard Bridge is 364.4 smoots long.\n, urls=[])")
+
+
+def turn(output: str, query: str = "Harvard Bridge smoots") -> list[dict]:
+    """user asks -> tool call -> tool output -> bot answers"""
+    return [
+        created({**msg("u1", "user"), "content": [{"type": "input_text", "text": "How long is it?"}]}),
+        created({"id": "f1", "type": "function_call", "call_id": "c1", "name": "get_knowledge_for_topic",
+                 "arguments": json.dumps({"queryString": query})}, "u1"),
+        created({"id": "o1", "type": "function_call_output", "call_id": "c1", "output": output}, "f1"),
+        created({**msg("b1", "assistant"), "content": [{"type": "text", "text": "364.4 smoots."}]}, "o1"),
+    ]
+
+
+def test_documents_are_parsed_from_tool_output() -> None:
+    assert parse_tool_output(DOCS) == [{"id": "d1", "title": "Harvard Bridge facts", "url": "https://x/1"}]
+
+
+def test_relevant_documents_raise_no_issues() -> None:
+    actions, summary = analyze(parse_events(turn(DOCS)))
+    assert actions[2]["retrievalOk"] and actions[2]["issues"] == []
+    assert actions[3]["issues"] == []
+    assert summary["issues"] == {}
+
+
+def test_empty_retrieval_makes_the_answer_ungrounded() -> None:
+    output = "LlmPromptBuilder(prompt=\nNo relevant document excerpts found\n, urls=[])"
+    actions, _ = analyze(parse_events(turn(output)))
+    assert actions[2]["issues"] == ["no_relevant_documents"]
+    assert actions[3]["issues"] == ["answer_not_grounded_in_retrieved_documents"]
+
+
+def test_off_topic_retrieval_is_flagged() -> None:
+    actions, _ = analyze(parse_events(turn(DOCS, query="refund policy for enterprise plans")))
+    assert "documents_unrelated_to_query" in actions[2]["issues"]
+    assert actions[2]["queryTermCoverage"] == 0.0
+    assert "answer_not_grounded_in_retrieved_documents" in actions[3]["issues"]
+
+
+def test_output_file_has_required_fields_and_no_nulls(tmp_path: Path) -> None:
+    actions, _ = analyze(parse_events(turn(DOCS)))
+    path = tmp_path / "actions.jsonl"
+    write_jsonl(actions, path)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["type"] for r in records] == [
+        "user-message", "function-call", "function-response", "bot-message"]
+    call = records[1]
+    assert {"type", "itemId", "previousItemId", "callId", "arguments", "position"} <= call.keys()
+    assert all(v is not None for r in records for v in r.values())
+    assert list(records[0])[:2] == ["position", "type"]

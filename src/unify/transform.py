@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import normalize as n
+from . import realtime
 from .readers import iter_files, pluck, read_any
 
 # Rows that could not be normalized. Written to the `rejects` table so nothing
@@ -41,13 +42,35 @@ def transform(raw_dir: Path) -> dict[str, list[dict[str, Any]]]:
     """Return {table_name: rows}. Add one entry per canonical entity."""
     tables: dict[str, list[dict[str, Any]]] = {}
 
-    # Uncomment and adapt once you have seen `unify profile` output:
-    # tables["tickets"] = tickets(raw_dir)
-    # tables["customers"] = customers(raw_dir)
+    tables["conversation_actions"] = conversation_actions(raw_dir)
 
     # Always returned, even empty, so a clean run clears the last run's rejects.
     tables["rejects"] = REJECTS
     return tables
+
+
+def conversation_actions(raw_dir: Path) -> list[dict[str, Any]]:
+    """Realtime recordings as one row per action, for SQL analysis.
+
+    Nested fields (arguments, documents, issues) are stored as JSON text.
+    Unreadable lines and malformed events go to rejects.
+    """
+    rows: list[dict[str, Any]] = []
+    for path in iter_files(raw_dir, "**/*.jsonline"):
+        conv = realtime.parse_file(path)
+        actions, summary = realtime.analyze(conv)
+        for message in conv.read_errors + conv.malformed:
+            reject(None, message, path.stem)
+        for action in actions:
+            rows.append({
+                "source_system": path.stem,
+                "source_id": action["itemId"],
+                "session_id": summary["sessionId"],
+                **realtime.to_record(action),
+            })
+    # TODO: this is a full reload per file. For a stream of recordings, key on
+    # (session_id, itemId) and upsert so re-processing a file is idempotent.
+    return rows
 
 
 # --- worked example, copy and adapt ---------------------------------------
