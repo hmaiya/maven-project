@@ -107,6 +107,7 @@ READERS = {
     ".tsv": read_csv,
     ".jsonl": read_jsonl,
     ".ndjson": read_jsonl,
+    ".jsonline": read_jsonl,   # Maven realtime recordings
     ".json": read_json,
 }
 
